@@ -20,22 +20,30 @@ on-chain surface for any of it. This repository is that surface, plus tests.
 
 ## Two findings
 
-**The published cutoff vectors disagree with the specification text.** Reported on the discussion thread; TMerlini confirmed it and sharpened the diagnosis.
+**The v0 cutoff vectors disagreed with the specification text.** Reported on the discussion thread;
+TMerlini confirmed it, sharpened the diagnosis, and shipped a v1 profile the next day.
 
-`no_in_force_binding` is doing double duty in the shipped v0 assets, over two cases that deserve opposite answers:
+`no_in_force_binding` was doing double duty in v0, over two cases that deserve opposite answers:
 
-| Case | Correct answer | v0 vector |
-|---|---|---|
-| pre-baseline, anchored before the first binding was registered | admit classical-only, it is innocent back catalogue | `REJECT` |
-| post-revocation, anchored after authority was deliberately ended | reject even pre-cutoff, revocation outranks the cutoff | `REJECT` |
+| Case | Correct answer | v0 | v1 |
+|---|---|---|---|
+| pre-baseline, anchored before the first binding was registered | admit, it is innocent back catalogue | `REJECT` | `ADMIT` |
+| post-revocation, anchored after authority was deliberately ended | refuse even pre-cutoff | `REJECT` | `REJECT` |
 
-The v1 profile fixes the first by activating the baseline at 0, so it governs from creation. This
-enforcer implements v1. It reproduces seven of the eight published vectors and disagrees only on
-the pre-baseline case, which is the half the ERC's shipped assets have not caught up with.
+This enforcer implements v1 and reproduces **all nine published v1 cases**, on both the decision and
+the evidence. The ERC's own PR still ships the v0 assets, so `test_v0_assets_still_reject_what_v1_admits`
+keeps that gap visible until they are advanced.
 
 Resolution runs before the cutoff, not after. An earlier revision here had that order backwards and
-admitted a post-revocation artifact because it fell on the classical-only side. That was wrong:
-ending authority is a stronger signal than a consumer's cutoff.
+admitted a post-revocation artifact because it fell on the classical-only side. Ending authority is a
+stronger signal than a consumer's cutoff.
+
+**Evidence and decision are separate fields.** v1 distinguishes a companion that was checked and
+failed (`refuted`) from one that could not be checked at all (`unverifiable`). Both refuse admission,
+and they are not the same fact: a consumer that merges them cannot tell a bad signature from a
+verifier that was down. So `verifyArtifact` returns a `PQDecision` and a `PQEvidence`, and both fail
+closed at their zero value. `Refuse` is 0 and `Unverifiable` is 0, so an unwritten slot or a failed
+decode can never read as admission or as proof of correctness.
 
 **Anchor time must be read, never passed.** ERC-8373 rests on the asymmetry that a compromised key
 can backdate a signature but cannot backdate an anchor. That holds only while the consumer reads

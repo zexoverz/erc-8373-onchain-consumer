@@ -12,19 +12,27 @@ pragma solidity ^0.8.0;
 
 // ── Outcome ──────────────────────────────────────────────────────────────────
 
-/// @notice The tri-state outcome of the ERC-8373 verification procedure.
-/// @dev    The ERC is explicit that a verifier which cannot complete a step MUST report the
-///         artifact unverifiable, "distinct from both accept and reject". Collapsing that into a
-///         bool is the single most likely way for an integrator to get this wrong, because the
-///         natural bool is `accepted`, and `false` then silently merges "we refused this" with "we
-///         could not tell".
+/// @notice What the verifier could establish about an artifact.
+/// @dev    ERC-8373's v1 conformance profile carries `evidence` and `decision` as SEPARATE fields,
+///         and the distinction is load-bearing. A companion that was checked and failed is
+///         `Refuted`. A companion that could not be checked at all is `Unverifiable`. Both refuse
+///         admission, but they are different facts and a consumer that merges them cannot tell a
+///         bad signature from a verifier that was down.
 ///
-///         `Unverifiable` is deliberately the zero value. A storage slot that was never written,
-///         a failed decode and a struct default all read as "we could not tell", never as accept.
-enum PQVerdict {
-    Unverifiable, // 0 — a step could not be completed. Never treat as authorization.
-    Accept, // 1 — anchored before the cutoff, or carries a valid in-force companion.
-    Reject // 2 — anchored at or after the cutoff with no valid in-force companion.
+///         `Unverifiable` is deliberately the zero value. An unwritten slot, a failed decode and a
+///         struct default all read as "we could not tell", never as evidence of correctness.
+enum PQEvidence {
+    Unverifiable, // 0 — a step could not be completed.
+    Verified, // 1 — checked and it holds.
+    Refuted // 2 — checked and it fails.
+}
+
+/// @notice Whether the artifact may be admitted.
+/// @dev    A projection of the evidence plus the cutoff rule, never a rename of the evidence.
+///         `Refuse` is the zero value, so anything unset or undecided fails closed.
+enum PQDecision {
+    Refuse, // 0 — do not admit. Read `PQEvidence` for why.
+    Admit // 1 — anchored before the cutoff, or carries a valid in-force companion.
 }
 
 // ── Anchor substrate ─────────────────────────────────────────────────────────
@@ -97,10 +105,14 @@ interface IPQKeyBindingConsumer {
     ///        artifact expected to fall before the cutoff
     /// @dev   Takes no anchor time. See `IPQAnchorRegistry`.
     ///
-    ///        MUST NOT revert on a well-formed-but-failing artifact: a refusal is `Reject` and an
-    ///        incomplete check is `Unverifiable`, both of which the caller needs to be able to
-    ///        distinguish and act on.
-    function verifyArtifact(bytes32 artifactContentAddress, bytes calldata companion) external view returns (PQVerdict);
+    ///        MUST NOT revert on a well-formed-but-failing artifact. A refusal and an incomplete
+    ///        check both return `Refuse`, and the caller separates them by reading `evidence`.
+    /// @return decision whether to admit; `Refuse` is the zero value so anything undecided fails closed
+    /// @return evidence what could actually be established, which `decision` alone cannot carry
+    function verifyArtifact(bytes32 artifactContentAddress, bytes calldata companion)
+        external
+        view
+        returns (PQDecision decision, PQEvidence evidence);
 
     /// @notice The binding governing artifacts anchored at `anchorTime`, resolved from the chain.
     /// @dev    ERC-8373: "Resolution MUST run from the chain even at length one." Rotations are
@@ -115,6 +127,10 @@ interface IPQKeyBindingConsumer {
     ///         same asymmetry ERC-8373 removes off-chain by insisting unverifiable is its own
     ///         state.
     event ArtifactSettled(
-        bytes32 indexed artifactContentAddress, bytes32 indexed inForceBinding, PQVerdict verdict, uint64 anchorTime
+        bytes32 indexed artifactContentAddress,
+        bytes32 indexed inForceBinding,
+        PQDecision decision,
+        PQEvidence evidence,
+        uint64 anchorTime
     );
 }

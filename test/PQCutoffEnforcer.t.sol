@@ -7,7 +7,8 @@ import {
     IPQAnchorRegistry,
     IPQCompanionVerifier,
     IPQKeyBindingConsumer,
-    PQVerdict
+    PQDecision,
+    PQEvidence
 } from "../src/IPQKeyBindingConsumer.sol";
 
 contract MockAnchorRegistry is IPQAnchorRegistry {
@@ -72,6 +73,14 @@ contract PQCutoffEnforcerTest is Test {
         enf.registerBinding(GENESIS, bytes32(0), PK1);
     }
 
+    function _dec(bytes32 a, bytes memory c) internal view returns (PQDecision d) {
+        (d,) = enf.verifyArtifact(a, c);
+    }
+
+    function _ev(bytes32 a, bytes memory c) internal view returns (PQEvidence e) {
+        (, e) = enf.verifyArtifact(a, c);
+    }
+
     function _artifact(bytes32 id, uint64 t) internal returns (bytes32) {
         reg.anchor(id, t, CLASSICAL);
         return id;
@@ -84,35 +93,35 @@ contract PQCutoffEnforcerTest is Test {
 
     function test_one_second_before_the_cutoff_is_accepted_without_a_companion() public {
         bytes32 a = _artifact(keccak256("early"), CUTOFF - 1);
-        assertEq(uint256(enf.verifyArtifact(a, "")), uint256(PQVerdict.Accept));
+        assertEq(uint256(_dec(a, "")), uint256(PQDecision.Admit));
     }
 
     function test_exactly_at_the_cutoff_is_not_admitted_classical_only() public {
         bytes32 a = _artifact(keccak256("at"), CUTOFF);
         assertEq(
-            uint256(enf.verifyArtifact(a, "")),
-            uint256(PQVerdict.Reject),
-            "the cutoff instant is on the far side of the cutoff"
+            uint256(_dec(a, "")), uint256(PQDecision.Refuse), "the cutoff instant is on the far side of the cutoff"
         );
     }
 
     function test_exactly_at_the_cutoff_is_accepted_with_a_valid_companion() public {
         bytes32 a = _artifact(keccak256("at2"), CUTOFF);
-        assertEq(uint256(enf.verifyArtifact(a, COMPANION)), uint256(PQVerdict.Accept));
+        assertEq(uint256(_dec(a, COMPANION)), uint256(PQDecision.Admit));
     }
 
     // ── The tri-state ────────────────────────────────────────────────────────
 
     /// Unverifiable must be the zero value, so an unwritten slot or a failed decode can never be
     /// mistaken for authorization.
-    function test_unverifiable_is_the_zero_verdict() public pure {
-        assertEq(uint256(PQVerdict.Unverifiable), 0);
+    /// Both zero values must fail closed: nothing established, nothing admitted.
+    function test_zero_values_fail_closed() public pure {
+        assertEq(uint256(PQEvidence.Unverifiable), 0);
+        assertEq(uint256(PQDecision.Refuse), 0);
     }
 
     /// An artifact nobody anchored is unknown, not refused. Refusing would let an indexing gap
     /// read as a policy decision.
     function test_unanchored_artifact_is_unverifiable_not_rejected() public view {
-        assertEq(uint256(enf.verifyArtifact(keccak256("never-anchored"), COMPANION)), uint256(PQVerdict.Unverifiable));
+        assertEq(uint256(_dec(keccak256("never-anchored"), COMPANION)), uint256(PQEvidence.Unverifiable));
     }
 
     /// A verifier that cannot answer leaves the artifact unverifiable. A reverting dependency is
@@ -120,20 +129,21 @@ contract PQCutoffEnforcerTest is Test {
     function test_failing_companion_verifier_is_unverifiable_not_rejected() public {
         bytes32 a = _artifact(keccak256("late"), CUTOFF + 10);
         ver.set(true, true);
-        assertEq(uint256(enf.verifyArtifact(a, COMPANION)), uint256(PQVerdict.Unverifiable));
+        assertEq(uint256(_dec(a, COMPANION)), uint256(PQDecision.Refuse), "gate closes");
+        assertEq(uint256(_ev(a, COMPANION)), uint256(PQEvidence.Unverifiable), "verifier down is not a bad signature");
     }
 
     /// A companion that is simply wrong is a reject, which must stay distinct from the above.
     function test_invalid_companion_is_rejected() public {
         bytes32 a = _artifact(keccak256("late2"), CUTOFF + 10);
         ver.set(false, false);
-        assertEq(uint256(enf.verifyArtifact(a, COMPANION)), uint256(PQVerdict.Reject));
+        assertEq(uint256(_dec(a, COMPANION)), uint256(PQDecision.Refuse));
     }
 
     /// The omission attack the ERC exists to close: after the cutoff, no companion is a reject.
     function test_omitted_companion_after_the_cutoff_fails_closed() public {
         bytes32 a = _artifact(keccak256("late3"), CUTOFF + 10);
-        assertEq(uint256(enf.verifyArtifact(a, "")), uint256(PQVerdict.Reject));
+        assertEq(uint256(_dec(a, "")), uint256(PQDecision.Refuse));
     }
 
     // ── Anchor time is read, never supplied ──────────────────────────────────
@@ -144,11 +154,11 @@ contract PQCutoffEnforcerTest is Test {
     function test_callers_cannot_move_an_artifact_across_the_cutoff() public {
         bytes32 a = _artifact(keccak256("fixed"), CUTOFF + 5);
         vm.prank(IMPOSTOR);
-        PQVerdict asImpostor = enf.verifyArtifact(a, "");
+        PQDecision asImpostor = _dec(a, "");
         vm.prank(CLASSICAL);
-        PQVerdict asOwner = enf.verifyArtifact(a, "");
+        PQDecision asOwner = _dec(a, "");
         assertEq(uint256(asImpostor), uint256(asOwner));
-        assertEq(uint256(asOwner), uint256(PQVerdict.Reject));
+        assertEq(uint256(asOwner), uint256(PQDecision.Refuse));
     }
 
     // ── Proof of possession comes from the anchoring transaction ─────────────
@@ -208,7 +218,7 @@ contract PQCutoffEnforcerTest is Test {
         reg.anchor(REVOKE_REC, CUTOFF + 200, CLASSICAL);
         enf.revokeBinding(GENESIS, REVOKE_REC);
         bytes32 a = _artifact(keccak256("post-revocation"), CUTOFF + 300);
-        assertEq(uint256(enf.verifyArtifact(a, COMPANION)), uint256(PQVerdict.Reject));
+        assertEq(uint256(_dec(a, COMPANION)), uint256(PQDecision.Refuse));
     }
 
     // ── Detectability ────────────────────────────────────────────────────────

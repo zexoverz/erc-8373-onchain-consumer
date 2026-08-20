@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 pragma solidity ^0.8.20;
 
-import {IPQKeyBindingConsumer, IPQAnchorRegistry, IPQCompanionVerifier, PQVerdict} from "./IPQKeyBindingConsumer.sol";
+import {
+    IPQKeyBindingConsumer,
+    IPQAnchorRegistry,
+    IPQCompanionVerifier,
+    PQDecision,
+    PQEvidence
+} from "./IPQKeyBindingConsumer.sol";
 
 /// @title A reference ERC-8373 cutoff enforcer
 /// @notice Implements the consumer half of the ERC-8373 verification procedure on-chain: read the
@@ -169,45 +175,45 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
         public
         view
         override
-        returns (PQVerdict)
+        returns (PQDecision, PQEvidence)
     {
         uint64 anchorTime = anchorRegistry.anchorTimeOf(artifactContentAddress);
 
-        // An artifact whose anchor cannot be read is not refused, it is unknown. Refusing here
-        // would let an indexing gap read as a policy decision.
-        if (anchorTime == 0) return PQVerdict.Unverifiable;
+        // An artifact whose anchor cannot be read is refused, but the evidence says we could not
+        // tell rather than that it was bad. Merging those would let an indexing gap read as a
+        // policy decision.
+        if (anchorTime == 0) return (PQDecision.Refuse, PQEvidence.Unverifiable);
 
-        // Resolution runs BEFORE the cutoff, not after. A revocation ends authority at its anchor
-        // time and that signal outranks the consumer's cutoff, so a post-revocation artifact is
-        // refused even when it falls on the classical-only side. Getting this order wrong is what
-        // makes "reject" mean two different things.
+        // Resolution runs BEFORE the cutoff. A revocation ends authority at its anchor time and
+        // that signal outranks the consumer's cutoff, so a post-revocation artifact is refused
+        // even when it falls on the classical-only side.
         bytes32 binding = inForceBindingAt(anchorTime);
-        if (binding == bytes32(0)) return PQVerdict.Reject;
+        if (binding == bytes32(0)) return (PQDecision.Refuse, PQEvidence.Refuted);
 
-        // "proven anchored before the consumer's cutoff". Strictly before: an artifact anchored at
-        // exactly the cutoff instant is on the far side of it and owes a companion.
-        if (anchorTime < cutoff) return PQVerdict.Accept;
+        // "proven anchored before the consumer's cutoff". Strictly before.
+        if (anchorTime < cutoff) return (PQDecision.Admit, PQEvidence.Verified);
 
-        if (companion.length == 0) return PQVerdict.Reject;
+        if (companion.length == 0) return (PQDecision.Refuse, PQEvidence.Refuted);
 
         bytes memory pqPubkey = _chain[_indexPlusOne[binding] - 1].pqPubkey;
 
-        // A verifier that cannot answer leaves the artifact unverifiable rather than refused.
+        // A verifier that cannot answer leaves the artifact unchecked. The gate still closes, but
+        // the evidence records that nothing was refuted, only that nothing was established.
         try companionVerifier.verifyCompanion(artifactContentAddress, pqPubkey, companion) returns (bool ok) {
-            return ok ? PQVerdict.Accept : PQVerdict.Reject;
+            return ok ? (PQDecision.Admit, PQEvidence.Verified) : (PQDecision.Refuse, PQEvidence.Refuted);
         } catch {
-            return PQVerdict.Unverifiable;
+            return (PQDecision.Refuse, PQEvidence.Unverifiable);
         }
     }
 
     /// @notice Verify and emit, so a refusal leaves a trace rather than vanishing.
     function settleArtifact(bytes32 artifactContentAddress, bytes calldata companion)
         external
-        returns (PQVerdict verdict)
+        returns (PQDecision decision, PQEvidence evidence)
     {
-        verdict = verifyArtifact(artifactContentAddress, companion);
+        (decision, evidence) = verifyArtifact(artifactContentAddress, companion);
         uint64 anchorTime = anchorRegistry.anchorTimeOf(artifactContentAddress);
-        emit ArtifactSettled(artifactContentAddress, inForceBindingAt(anchorTime), verdict, anchorTime);
+        emit ArtifactSettled(artifactContentAddress, inForceBindingAt(anchorTime), decision, evidence, anchorTime);
     }
 
     // ── ERC-165 ──────────────────────────────────────────────────────────────
