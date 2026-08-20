@@ -20,21 +20,22 @@ on-chain surface for any of it. This repository is that surface, plus tests.
 
 ## Two findings
 
-**The published cutoff vectors disagree with the specification text in two of eight cases.**
+**The published cutoff vectors disagree with the specification text.** Reported on the discussion thread; TMerlini confirmed it and sharpened the diagnosis.
 
-ERC-8373's verification procedure, step 3, is "If anchor time < cutoff: verify classically; accept",
-and it does not consult the binding chain. Two vectors expect `REJECT` for artifacts anchored before
-the cutoff, on the ground that no binding was in force at that instant.
+`no_in_force_binding` is doing double duty in the shipped v0 assets, over two cases that deserve opposite answers:
 
-| Case | Anchor time | Cutoff | Spec text | Published vector |
-|---|---|---|---|---|
-| artifact anchored before any binding existed | 1785000000 | 1790000000 | accept | `REJECT` |
-| artifact anchored at/after revocation | 1786500000 | 1790000000 | accept | `REJECT` |
+| Case | Correct answer | v0 vector |
+|---|---|---|
+| pre-baseline, anchored before the first binding was registered | admit classical-only, it is innocent back catalogue | `REJECT` |
+| post-revocation, anchored after authority was deliberately ended | reject even pre-cutoff, revocation outranks the cutoff | `REJECT` |
 
-Under the vector reading, a revocation retroactively invalidates artifacts that were anchored before
-the cutoff. The proposal's own introduction states the opposite: "the back catalog is never
-retroactively invalidated". The enforcer here follows the specification text, and the two cases are
-asserted separately so that changing either side makes a test fail.
+The v1 profile fixes the first by activating the baseline at 0, so it governs from creation. This
+enforcer implements v1. It reproduces seven of the eight published vectors and disagrees only on
+the pre-baseline case, which is the half the ERC's shipped assets have not caught up with.
+
+Resolution runs before the cutoff, not after. An earlier revision here had that order backwards and
+admitted a post-revocation artifact because it fell on the classical-only side. That was wrong:
+ending authority is a stronger signal than a consumer's cutoff.
 
 **Anchor time must be read, never passed.** ERC-8373 rests on the asymmetry that a compromised key
 can backdate a signature but cannot backdate an anchor. That holds only while the consumer reads

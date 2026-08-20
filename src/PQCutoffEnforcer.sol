@@ -14,6 +14,7 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
         bytes32 contentAddress;
         bytes32 predecessor; // bytes32(0) for the genesis binding
         uint64 anchorTime; // read from the substrate, never supplied
+        uint64 activatedAt; // 0 for the baseline, anchorTime for every successor
         uint64 revokedAt; // 0 while live
         bool terminal;
         bytes pqPubkey;
@@ -80,11 +81,17 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
             if (anchorTime <= p.anchorTime) revert RotationNotForward(p.anchorTime, anchorTime);
         }
 
+        // v1 profile: the baseline governs from creation, because anchoring gives a binding a
+        // provable time rather than a birthday. Successors keep activatedAt = anchor, so a
+        // rotation still cannot claim retroactive coverage.
+        uint64 activatedAt = _chain.length == 0 ? 0 : anchorTime;
+
         _chain.push(
             Binding({
                 contentAddress: contentAddress,
                 predecessor: predecessor,
                 anchorTime: anchorTime,
+                activatedAt: activatedAt,
                 revokedAt: 0,
                 terminal: false,
                 pqPubkey: pqPubkey
@@ -119,15 +126,26 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
     // ── Resolution ───────────────────────────────────────────────────────────
 
     /// @inheritdoc IPQKeyBindingConsumer
-    /// @dev The in-force binding at an instant is the latest one anchored at or before it that has
-    ///      not been revoked by then. Revocation does not fall back to the predecessor: a revoked
-    ///      binding leaves nothing in force for that instant. That reading is fail-closed, but the
-    ///      ERC does not state it either way, and it is worth the authors settling explicitly.
+    /// @dev The in-force binding at an instant is the latest one ACTIVE at or before it that has
+    ///      not been revoked by then.
+    ///
+    ///      Two cases the reason string must not merge, which is the defect the published v0
+    ///      vectors carry:
+    ///
+    ///      - **pre-baseline**, anchored before the first binding was registered. Innocent back
+    ///        catalogue. The baseline activates at 0 and governs from creation, so this resolves
+    ///        rather than falling through, and the cutoff then admits it classical-only.
+    ///      - **post-revocation**, anchored after a binding's authority was deliberately ended.
+    ///        A revocation is a trust-ending act and its signal is stronger than the consumer's
+    ///        cutoff, so this resolves to nothing and is refused even before the cutoff.
+    ///
+    ///      Authority never reverts to a predecessor. That would resurrect something the owner
+    ///      retired.
     function inForceBindingAt(uint64 anchorTime) public view override returns (bytes32) {
         uint256 n = _chain.length;
         for (uint256 i = n; i > 0; i--) {
             Binding storage b = _chain[i - 1];
-            if (b.anchorTime > anchorTime) continue;
+            if (b.activatedAt > anchorTime) continue;
             if (b.revokedAt != 0 && b.revokedAt <= anchorTime) return bytes32(0);
             return b.contentAddress;
         }
@@ -159,12 +177,16 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
         // would let an indexing gap read as a policy decision.
         if (anchorTime == 0) return PQVerdict.Unverifiable;
 
+        // Resolution runs BEFORE the cutoff, not after. A revocation ends authority at its anchor
+        // time and that signal outranks the consumer's cutoff, so a post-revocation artifact is
+        // refused even when it falls on the classical-only side. Getting this order wrong is what
+        // makes "reject" mean two different things.
+        bytes32 binding = inForceBindingAt(anchorTime);
+        if (binding == bytes32(0)) return PQVerdict.Reject;
+
         // "proven anchored before the consumer's cutoff". Strictly before: an artifact anchored at
         // exactly the cutoff instant is on the far side of it and owes a companion.
         if (anchorTime < cutoff) return PQVerdict.Accept;
-
-        bytes32 binding = inForceBindingAt(anchorTime);
-        if (binding == bytes32(0)) return PQVerdict.Reject;
 
         if (companion.length == 0) return PQVerdict.Reject;
 

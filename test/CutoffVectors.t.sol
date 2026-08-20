@@ -154,7 +154,7 @@ contract CutoffVectorsTest is Test {
     function test_enforcer_reproduces_the_undisputed_vectors() public {
         uint256 agreed;
         for (uint256 i = 0; i < caseCount; i++) {
-            if (i == 5 || i == 7) continue; // the two disputed cases
+            if (i == 5) continue; // the one remaining disputed case
             (PQVerdict got, string memory expected) = _runCase(i);
             assertEq(
                 uint256(got),
@@ -163,35 +163,42 @@ contract CutoffVectorsTest is Test {
             );
             agreed++;
         }
-        assertEq(agreed, 6);
+        assertEq(agreed, 7);
     }
 
-    // ── The two disputed cases ───────────────────────────────────────────────
+    // ── The one disputed case that remains ───────────────────────────────────
     //
-    // ERC-8373's Specification says a consumer MUST accept an artifact if it is "proven anchored
-    // before the consumer's cutoff", and its verification procedure step 3 is "If anchor time <
-    // cutoff: verify classically; accept" without consulting the binding chain at all.
+    // TMerlini confirmed on the thread that the published v0 vectors carry a real inconsistency,
+    // and sharpened it: `no_in_force_binding` is doing double duty over two cases that deserve
+    // opposite answers.
     //
-    // Both artifacts below are anchored before the consumer cutoff. The published vectors expect
-    // REJECT for both, on the ground that no binding was in force at that instant.
+    //   pre-baseline    anchored before the first binding was registered. Innocent back
+    //                   catalogue, must admit classical-only.
+    //   post-revocation anchored after a binding's authority was deliberately ended. A revocation
+    //                   is a trust-ending act whose signal outranks the consumer's cutoff, so it
+    //                   must be refused even pre-cutoff.
     //
-    // These tests assert the specification text, so they fail if the implementation is quietly
-    // changed to match the vectors instead. The disagreement is for the authors to settle.
+    // The v1 profile fixes the first by activating the baseline at 0. This enforcer implements v1,
+    // so it now agrees with the published vector on the post-revocation case and disagrees only on
+    // the pre-baseline one, which is the half the ERC's shipped assets have not caught up with.
 
-    /// Anchored at 1785000000, before the genesis binding existed, and before the 1790000000
-    /// cutoff. The spec admits it classical-only. The vector rejects it.
-    function test_disputed_pre_binding_artifact_follows_the_spec_not_the_vector() public {
+    /// Anchored at 1785000000, before the genesis binding existed, and before the cutoff. Under v1
+    /// the baseline governs from creation, so this resolves and the cutoff admits it classical-only.
+    /// The shipped v0 vector rejects it. That gap is the one being remediated by advancing the
+    /// assets, not a defect in this implementation.
+    function test_pre_baseline_artifact_admits_under_v1_and_is_rejected_by_the_v0_vector() public {
         (PQVerdict got, string memory expected) = _runCase(5);
-        assertEq(uint256(got), uint256(PQVerdict.Accept), "spec step 3 admits it");
-        assertEq(_asVerdict(expected) == PQVerdict.Reject, true, "the vector rejects it");
+        assertEq(uint256(got), uint256(PQVerdict.Accept), "v1 baseline activates at 0");
+        assertEq(_asVerdict(expected) == PQVerdict.Reject, true, "the shipped v0 vector rejects it");
     }
 
-    /// Anchored at 1786500000, after a revocation at 1786000000 but still before the cutoff.
-    /// Under the vector's reading a revocation retroactively invalidates back-catalogue artifacts,
-    /// which is the property the proposal's own introduction says the cutoff design preserves.
-    function test_disputed_post_revocation_artifact_follows_the_spec_not_the_vector() public {
+    /// Anchored at 1786500000, after a revocation at 1786000000 and still before the cutoff.
+    /// Refused, because ending authority is a stronger signal than the cutoff. An earlier revision
+    /// of this file asserted the opposite by reading the cutoff clause in isolation, which was
+    /// wrong: resolution runs first.
+    function test_post_revocation_artifact_is_refused_even_before_the_cutoff() public {
         (PQVerdict got, string memory expected) = _runCase(7);
-        assertEq(uint256(got), uint256(PQVerdict.Accept), "anchored before the cutoff");
-        assertEq(_asVerdict(expected) == PQVerdict.Reject, true, "the vector rejects it");
+        assertEq(uint256(got), uint256(PQVerdict.Reject), "revocation outranks the cutoff");
+        assertEq(uint256(_asVerdict(expected)), uint256(PQVerdict.Reject), "the vector agrees");
     }
 }
