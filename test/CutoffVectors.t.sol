@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
 import {PQCutoffEnforcer} from "../src/PQCutoffEnforcer.sol";
-import {IPQAnchorRegistry, IPQCompanionVerifier, PQDecision, PQEvidence} from "../src/IPQKeyBindingConsumer.sol";
+import {IPQAnchorRegistry, IPQCompanionVerifier, PQDecision, PQEvidence, PQReason} from "../src/IPQKeyBindingConsumer.sol";
 import {VectorChain, VectorBinding, ChainShape} from "./VectorChain.sol";
 
 /// @notice A substrate replaying the anchor times the vectors record, and nothing else.
@@ -91,32 +91,27 @@ contract CutoffVectorsTest is Test {
 
     /// @dev Returns the enforcer with the case's declared chain built, plus `unrepresentable` set
     ///      to the capability the enforcer lacks when the state cannot be reached at all.
-    function _build(uint256 i)
-        internal
-        returns (PQCutoffEnforcer enf, VectorCompanionVerifier ver, string memory unrepresentable)
-    {
+    function _build(uint256 i) internal returns (PQCutoffEnforcer enf, VectorCompanionVerifier ver) {
         VectorAnchorSubstrate sub = new VectorAnchorSubstrate();
         ver = new VectorCompanionVerifier();
         enf = new PQCutoffEnforcer(consumerCutoff, sub, ver, CLASSICAL);
 
         ChainShape shape = VectorChain.shapeOf(json, i);
 
-        if (shape == ChainShape.Unavailable) {
-            // `bindings: null` means the chain could not be fetched. The enforcer has no way to
-            // say that: an unloaded chain and a chain that resolves to nothing are the same
-            // zero-length array, so it answers Refuted where the case requires Unverifiable.
-            return (enf, ver, "chain-unavailable state (bindings:null) is not representable: an unloaded chain is indistinguishable from an empty one");
-        }
+        // `bindings: null`. Load nothing at all, which is now a state the enforcer can hold.
+        if (shape == ChainShape.Unavailable) return (enf, ver);
 
+        // `bindings: []`. Fetched, and this identity has none. A different fact from the above.
         if (shape == ChainShape.Empty) {
-            return (enf, ver, ""); // an empty chain is exactly a chain with nothing registered
+            enf.declareChainEmpty();
+            return (enf, ver);
         }
 
         if (shape == ChainShape.Default) {
             bytes32 ca = keccak256(bytes(vm.parseJsonString(json, ".bindings[0].name")));
             sub.anchor(ca, uint64(vm.parseJsonUint(json, ".bindings[0].binding_anchor_time")), CLASSICAL);
             enf.registerBinding(ca, bytes32(0), bytes(vm.parseJsonString(json, ".bindings[0].pq_pubkey")));
-            return (enf, ver, "");
+            return (enf, ver);
         }
 
         uint256 n = VectorChain.countOf(json, i);
@@ -125,23 +120,12 @@ contract CutoffVectorsTest is Test {
             VectorBinding memory b =
                 VectorChain.readAt(json, string.concat(VectorChain.path(i), "[", vm.toString(k), "]"));
 
-            if (!b.anchored) {
-                // `binding_anchor_time: null`. registerBinding reads the anchor from the substrate
-                // and reverts NotAnchored, so an un-anchored binding cannot enter the chain at all
-                // and the case's declared state is unreachable.
-                return (enf, ver, string.concat("un-anchored binding '", b.name, "' cannot be registered: registerBinding reverts NotAnchored"));
-            }
-
-            if (b.hasActivatedAt && b.activatedAt != (k == 0 ? 0 : b.anchorTime)) {
-                // The enforcer derives activatedAt rather than accepting it, so a declared value
-                // that disagrees (case 17's retroactive activation) cannot be presented, and the
-                // malformed chain it is meant to expose is never seen.
-                return (enf, ver, "declared activated_at cannot be presented: the enforcer derives it and has no malformed-chain state");
-            }
-
             bytes32 ca = keccak256(bytes(b.name));
-            sub.anchor(ca, b.anchorTime, CLASSICAL);
-            enf.registerBinding(ca, prev, b.pqPubkey);
+            // An un-anchored binding is anchored nowhere, so the substrate is simply not told
+            // about it and the enforcer reads back a zero anchor time.
+            if (b.anchored) sub.anchor(ca, b.anchorTime, CLASSICAL);
+
+            enf.registerBindingWithActivation(ca, prev, b.pqPubkey, b.hasActivatedAt, b.activatedAt);
             prev = ca;
 
             if (b.hasRevokedAt) {
@@ -150,17 +134,10 @@ contract CutoffVectorsTest is Test {
                 enf.revokeBinding(ca, rec);
             }
         }
-        return (enf, ver, "");
     }
 
-    function _runCase(uint256 i)
-        internal
-        returns (PQDecision decision, PQEvidence evidence, string memory unrepresentable)
-    {
-        PQCutoffEnforcer enf;
-        VectorCompanionVerifier ver;
-        (enf, ver, unrepresentable) = _build(i);
-        if (bytes(unrepresentable).length != 0) return (PQDecision.Refuse, PQEvidence.Unverifiable, unrepresentable);
+    function _runCase(uint256 i) internal returns (PQDecision decision, PQEvidence evidence, PQReason reason) {
+        (PQCutoffEnforcer enf, VectorCompanionVerifier ver) = _build(i);
 
         VectorAnchorSubstrate sub = VectorAnchorSubstrate(address(enf.anchorRegistry()));
         uint64 anchorTime = uint64(vm.parseJsonUint(json, string.concat(_case(i), ".artifact.anchor_time")));
@@ -168,7 +145,7 @@ contract CutoffVectorsTest is Test {
         sub.anchor(artifact, anchorTime, CLASSICAL);
 
         bytes memory companion = _configureCompanion(i, ver);
-        (decision, evidence) = enf.verifyArtifact(artifact, companion);
+        (decision, evidence, reason) = enf.verifyArtifact(artifact, companion);
     }
 
     /// Reads the companion block for a case and configures the verifier to match it.
@@ -215,6 +192,25 @@ contract CutoffVectorsTest is Test {
         return PQEvidence.Verified;
     }
 
+    function _asReason(string memory r) internal pure returns (PQReason) {
+        bytes32 h = keccak256(bytes(r));
+        if (h == keccak256("resolved_at_anchor_time")) return PQReason.ResolvedAtAnchorTime;
+        if (h == keccak256("pre_baseline")) return PQReason.PreBaseline;
+        if (h == keccak256("no_in_force_binding")) return PQReason.NoInForceBinding;
+        if (h == keccak256("no_bindings_in_chain")) return PQReason.NoBindingsInChain;
+        if (h == keccak256("chain_malformed")) return PQReason.ChainMalformed;
+        if (h == keccak256("binding_anchor_unavailable")) return PQReason.BindingAnchorUnavailable;
+        if (h == keccak256("chain_unavailable")) return PQReason.ChainUnavailable;
+        revert(string.concat("vector declares a reason this enum has no value for: ", r));
+    }
+
+    function _firstCaseWithReason(string memory want) internal view returns (uint256, bool) {
+        for (uint256 i = 0; i < caseCount; i++) {
+            if (keccak256(bytes(_expected(i, "resolution_reason"))) == keccak256(bytes(want))) return (i, true);
+        }
+        return (0, false);
+    }
+
     function _expected(uint256 i, string memory field) internal view returns (string memory) {
         return vm.parseJsonString(json, string.concat(_case(i), ".expected.", field));
     }
@@ -228,27 +224,39 @@ contract CutoffVectorsTest is Test {
         assertEq(caseCount, 26, "the published v1 set has 26 cases; a different count means a stale copy");
     }
 
-    /// Every state the file declares must be reachable. A case the enforcer cannot be driven into
-    /// is a gap in the enforcer, and silently skipping it is how a suite reports coverage it does
-    /// not have.
-    function test_every_declared_state_is_representable() public {
-        string memory gaps;
-        uint256 n;
+    /// The reason is the field ERC-8373 makes REQUIRED for an unverifiable and requires to be a
+    /// closed enumeration on-chain. It is also what stops `pre_baseline` and ended authority being
+    /// reported as the same answer, which the ERC forbids by name.
+    function test_enforcer_reproduces_every_v1_reason() public {
         for (uint256 i = 0; i < caseCount; i++) {
-            (,, string memory why) = _runCase(i);
-            if (bytes(why).length != 0) {
-                n++;
-                gaps = string.concat(gaps, "\n  case ", vm.toString(i), ": ", why);
-            }
+            (,, PQReason got) = _runCase(i);
+            assertEq(
+                uint256(got),
+                uint256(_asReason(_expected(i, "resolution_reason"))),
+                string.concat("case ", vm.toString(i), " reason")
+            );
         }
-        assertEq(n, 0, string.concat("states the enforcer cannot represent:", gaps));
+    }
+
+    /// The two the ERC singles out. Opposite answers, and a consumer that merged them would admit
+    /// artifacts whose authority was deliberately ended.
+    function test_pre_baseline_and_ended_authority_are_not_the_same_answer() public {
+        (uint256 pre, bool foundPre) = _firstCaseWithReason("pre_baseline");
+        (uint256 ended, bool foundEnded) = _firstCaseWithReason("no_in_force_binding");
+        assertTrue(foundPre && foundEnded, "the file must declare both");
+
+        (PQDecision dPre,, PQReason rPre) = _runCase(pre);
+        (PQDecision dEnd,, PQReason rEnd) = _runCase(ended);
+
+        assertTrue(rPre != rEnd, "one reason for both would be the collapse the ERC forbids");
+        assertEq(uint256(dPre), uint256(PQDecision.Admit), "the back catalogue is admitted");
+        assertEq(uint256(dEnd), uint256(PQDecision.Refuse), "ended authority is refused");
     }
 
     /// Every published case reproduces on the admission decision.
     function test_enforcer_reproduces_every_v1_decision() public {
         for (uint256 i = 0; i < caseCount; i++) {
-            (PQDecision got,, string memory why) = _runCase(i);
-            if (bytes(why).length != 0) continue; // counted by the representability test
+            (PQDecision got,,) = _runCase(i);
             assertEq(
                 uint256(got),
                 uint256(_asDecision(_expected(i, "decision"))),
@@ -261,8 +269,7 @@ contract CutoffVectorsTest is Test {
     function test_enforcer_reproduces_every_v1_evidence() public {
         uint256 checked;
         for (uint256 i = 0; i < caseCount; i++) {
-            (, PQEvidence got, string memory why) = _runCase(i);
-            if (bytes(why).length != 0) continue;
+            (, PQEvidence got,) = _runCase(i);
             assertEq(
                 uint256(got),
                 uint256(_asEvidence(_expected(i, "evidence"))),
@@ -291,10 +298,8 @@ contract CutoffVectorsTest is Test {
         assertTrue(eRef != eUnc, "a single verdict field would merge these");
     }
 
-    function _firstCaseWithEvidence(string memory want) internal returns (uint256, bool) {
+    function _firstCaseWithEvidence(string memory want) internal view returns (uint256, bool) {
         for (uint256 i = 0; i < caseCount; i++) {
-            (,, string memory why) = _runCase(i);
-            if (bytes(why).length != 0) continue;
             if (keccak256(bytes(_expected(i, "evidence"))) == keccak256(bytes(want))) return (i, true);
         }
         return (0, false);

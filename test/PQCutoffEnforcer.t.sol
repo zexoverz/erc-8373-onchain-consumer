@@ -8,7 +8,8 @@ import {
     IPQCompanionVerifier,
     IPQKeyBindingConsumer,
     PQDecision,
-    PQEvidence
+    PQEvidence,
+    PQReason
 } from "../src/IPQKeyBindingConsumer.sol";
 
 contract MockAnchorRegistry is IPQAnchorRegistry {
@@ -74,11 +75,11 @@ contract PQCutoffEnforcerTest is Test {
     }
 
     function _dec(bytes32 a, bytes memory c) internal view returns (PQDecision d) {
-        (d,) = enf.verifyArtifact(a, c);
+        (d,,) = enf.verifyArtifact(a, c);
     }
 
     function _ev(bytes32 a, bytes memory c) internal view returns (PQEvidence e) {
-        (, e) = enf.verifyArtifact(a, c);
+        (, e,) = enf.verifyArtifact(a, c);
     }
 
     function _artifact(bytes32 id, uint64 t) internal returns (bytes32) {
@@ -172,9 +173,52 @@ contract PQCutoffEnforcerTest is Test {
         enf.registerBinding(b, GENESIS, PK2);
     }
 
-    function test_unanchored_binding_cannot_be_registered() public {
-        vm.expectRevert(abi.encodeWithSelector(PQCutoffEnforcer.NotAnchored.selector, keccak256("ghost")));
-        enf.registerBinding(keccak256("ghost"), GENESIS, PK2);
+    /// An un-anchored binding is admitted and then never allowed to govern.
+    ///
+    /// This replaces an assertion that it reverts. Reverting reads as the stricter choice and is
+    /// the weaker one: a binding that cannot enter the chain cannot be reported either, so the
+    /// chain silently looked shorter than it was and resolution answered from whatever remained.
+    /// ERC-8373 wants an unreadable anchor surfaced as unverifiable with a reason. The published
+    /// cases 21, 22 and 25 are unreachable under the old behaviour, which is how the gap was found.
+    function test_unanchored_binding_is_admitted_but_never_governs() public {
+        bytes32 ghost = keccak256("ghost");
+        enf.registerBinding(ghost, GENESIS, PK2);
+
+        assertEq(enf.inForceBindingAt(CUTOFF - 1), GENESIS, "the anchored binding still governs");
+        assertTrue(enf.inForceBindingAt(CUTOFF - 1) != ghost, "an un-anchored binding never governs");
+    }
+
+    /// And when nothing anchored is left, that is its own reason rather than an empty chain.
+    function test_only_unanchored_bindings_reports_binding_anchor_unavailable() public {
+        MockAnchorRegistry sub = new MockAnchorRegistry();
+        PQCutoffEnforcer bare = new PQCutoffEnforcer(CUTOFF, sub, ver, CLASSICAL);
+        bare.registerBinding(keccak256("ghost"), bytes32(0), PK2);
+
+        bytes32 art = keccak256("artifact");
+        sub.anchor(art, CUTOFF - 1, CLASSICAL);
+
+        (PQDecision d, PQEvidence e, PQReason r) = bare.verifyArtifact(art, "");
+        assertEq(uint256(d), uint256(PQDecision.Refuse));
+        assertEq(uint256(e), uint256(PQEvidence.Unverifiable), "an unreadable anchor is not a refutation");
+        assertEq(uint256(r), uint256(PQReason.BindingAnchorUnavailable));
+    }
+
+    /// A chain nobody loaded is not a chain that resolves to nothing.
+    function test_unloaded_chain_is_unverifiable_not_refuted() public {
+        MockAnchorRegistry sub = new MockAnchorRegistry();
+        PQCutoffEnforcer bare = new PQCutoffEnforcer(CUTOFF, sub, ver, CLASSICAL);
+
+        bytes32 art = keccak256("artifact");
+        sub.anchor(art, CUTOFF - 1, CLASSICAL);
+
+        (, PQEvidence e, PQReason r) = bare.verifyArtifact(art, "");
+        assertEq(uint256(e), uint256(PQEvidence.Unverifiable), "nothing was established");
+        assertEq(uint256(r), uint256(PQReason.ChainUnavailable));
+
+        bare.declareChainEmpty();
+        (, PQEvidence e2, PQReason r2) = bare.verifyArtifact(art, "");
+        assertEq(uint256(e2), uint256(PQEvidence.Refuted), "an empty chain is a determinate answer");
+        assertEq(uint256(r2), uint256(PQReason.NoBindingsInChain));
     }
 
     // ── Rotation is forward-acting ───────────────────────────────────────────

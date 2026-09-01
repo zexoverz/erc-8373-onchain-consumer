@@ -35,6 +35,28 @@ enum PQDecision {
     Admit // 1 — anchored before the cutoff, or carries a valid in-force companion.
 }
 
+/// @notice Why the verdict came out the way it did.
+///
+/// @dev ERC-8373 requires an `unverifiable` result to carry a reason, REQUIRED rather than
+///      RECOMMENDED, and requires that on-chain the reason be a closed enumeration rather than
+///      free text. It also forbids collapsing `pre_baseline` and a revoked authority into one
+///      reason, because they are opposite answers: an innocent back catalogue against deliberately
+///      ended authority.
+///
+///      `ChainUnavailable` holds the zero slot on purpose, for the same reason `Refuse` and
+///      `Unverifiable` hold theirs. A consumer that has not loaded a chain has established
+///      nothing, and the honest default is to say so rather than to report a resolution nobody
+///      performed. An empty chain is a different fact and gets its own value.
+enum PQReason {
+    ChainUnavailable, // 0 — the chain could not be loaded. Nothing was resolved.
+    ResolvedAtAnchorTime, // 1 — a binding governs the artifact's anchor time.
+    PreBaseline, // 2 — anchored before any binding governed. The back catalogue.
+    NoInForceBinding, // 3 — authority ended at or before the anchor time.
+    NoBindingsInChain, // 4 — the chain loaded and this identity has none.
+    ChainMalformed, // 5 — a binding claims activation before its own anchor.
+    BindingAnchorUnavailable // 6 — every declared binding lacks a readable anchor.
+}
+
 // ── Anchor substrate ─────────────────────────────────────────────────────────
 
 /// @notice The anchor substrate, read-side.
@@ -109,10 +131,11 @@ interface IPQKeyBindingConsumer {
     ///        check both return `Refuse`, and the caller separates them by reading `evidence`.
     /// @return decision whether to admit; `Refuse` is the zero value so anything undecided fails closed
     /// @return evidence what could actually be established, which `decision` alone cannot carry
+    /// @return reason the closed-enumeration cause ERC-8373 requires an unverifiable to carry
     function verifyArtifact(bytes32 artifactContentAddress, bytes calldata companion)
         external
         view
-        returns (PQDecision decision, PQEvidence evidence);
+        returns (PQDecision decision, PQEvidence evidence, PQReason reason);
 
     /// @notice The binding governing artifacts anchored at `anchorTime`, resolved from the chain.
     /// @dev    ERC-8373: "Resolution MUST run from the chain even at length one." Rotations are
@@ -131,6 +154,7 @@ interface IPQKeyBindingConsumer {
         bytes32 indexed inForceBinding,
         PQDecision decision,
         PQEvidence evidence,
+        PQReason reason,
         uint64 anchorTime
     );
 }

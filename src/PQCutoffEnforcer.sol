@@ -6,7 +6,8 @@ import {
     IPQAnchorRegistry,
     IPQCompanionVerifier,
     PQDecision,
-    PQEvidence
+    PQEvidence,
+    PQReason
 } from "./IPQKeyBindingConsumer.sol";
 
 /// @title A reference ERC-8373 cutoff enforcer
@@ -19,10 +20,12 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
     struct Binding {
         bytes32 contentAddress;
         bytes32 predecessor; // bytes32(0) for the genesis binding
+        bool anchored; // false when the substrate has no anchor for it
         uint64 anchorTime; // read from the substrate, never supplied
-        uint64 activatedAt; // 0 for the baseline, anchorTime for every successor
+        uint64 activatedAt; // declared if given, else the binding's own anchor
         uint64 revokedAt; // 0 while live
         bool terminal;
+        bool malformed; // activation precedes its own anchor, which cannot reopen the past
         bytes pqPubkey;
     }
 
@@ -35,6 +38,14 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
 
     Binding[] private _chain;
     mapping(bytes32 => uint256) private _indexPlusOne;
+
+    /// @notice Whether a chain has been loaded at all.
+    /// @dev    This is the fix for the defect the published case 12 exists to catch. Before it,
+    ///         "the chain could not be fetched" and "the chain was fetched and resolves to
+    ///         nothing" were the same zero-length array, so an unresolved dependency read as a
+    ///         determinate refusal. They are opposite facts: one is unverifiable, the other is
+    ///         refuted. False is the zero value, so a consumer that has loaded nothing says so.
+    bool public chainLoaded;
 
     error NotAnchored(bytes32 contentAddress);
     error WrongAnchorer(address expected, address actual);
@@ -68,13 +79,49 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
     ///         dual-signature on rotation) is not verifiable in the EVM today. It is delegated,
     ///         like the companion check, rather than silently assumed.
     function registerBinding(bytes32 contentAddress, bytes32 predecessor, bytes calldata pqPubkey) external {
+        registerBindingWithActivation(contentAddress, predecessor, pqPubkey, false, 0);
+    }
+
+    /// @notice Admit a binding into the chain, optionally with a declared activation boundary.
+    ///
+    /// @param activationDeclared whether the chain states an activation at all. This is a separate
+    ///        flag rather than a zero sentinel because zero is a meaningful declared value: the
+    ///        published case 17 declares `activated_at: 0` against an anchor of 100, and that is
+    ///        precisely the retroactive activation the malformed check exists to catch. A sentinel
+    ///        would make the one case that matters look like an absent field.
+    /// @param declaredActivation the binding's own activation instant when `activationDeclared`.
+    ///        ERC-8373 puts the `in_force` interval at `B <= t < R` with `B` the
+    ///        activation anchor, and a deployment may declare an activation later than the anchor
+    ///        (a binding published now, governing from a scheduled boundary). Deriving it, which
+    ///        this contract used to do unconditionally, makes that state unrepresentable and makes
+    ///        the retroactive case below undetectable.
+    ///
+    /// @dev An un-anchored binding is admitted rather than rejected, and that is deliberate. The
+    ///      old code reverted `NotAnchored`, which sounds strict and is actually weaker: a state
+    ///      that cannot be entered cannot be reported, so the chain silently looked shorter than
+    ///      it was and resolution answered from whatever remained. ERC-8373 wants an unreadable
+    ///      anchor surfaced as `unverifiable` with a reason, not made invisible. Resolution skips
+    ///      un-anchored bindings and reports `BindingAnchorUnavailable` when nothing anchored is
+    ///      left, so this admits the binding without ever letting it govern.
+    function registerBindingWithActivation(
+        bytes32 contentAddress,
+        bytes32 predecessor,
+        bytes calldata pqPubkey,
+        bool activationDeclared,
+        uint64 declaredActivation
+    ) public {
         if (_indexPlusOne[contentAddress] != 0) revert AlreadyRegistered(contentAddress);
 
         uint64 anchorTime = anchorRegistry.anchorTimeOf(contentAddress);
-        if (anchorTime == 0) revert NotAnchored(contentAddress);
+        bool anchored = anchorTime != 0;
 
-        address anchorer = anchorRegistry.anchoredBy(contentAddress);
-        if (anchorer != classicalAddress) revert WrongAnchorer(classicalAddress, anchorer);
+        // The anchoring transaction is the classical proof-of-possession, so a binding anchored by
+        // any other address is not this identity's binding. With no anchor there is no such proof
+        // to check, and the binding is admitted only so it can be reported as unverifiable.
+        if (anchored) {
+            address anchorer = anchorRegistry.anchoredBy(contentAddress);
+            if (anchorer != classicalAddress) revert WrongAnchorer(classicalAddress, anchorer);
+        }
 
         if (_chain.length != 0) {
             uint256 pi = _indexPlusOne[predecessor];
@@ -83,27 +130,43 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
             if (p.terminal) revert ChainIsTerminal();
             // Rotation is forward-acting, so a successor cannot claim an earlier anchor than the
             // binding it replaces. Without this, a late-registered but early-anchored statement
-            // could be inserted behind an existing one and change history.
-            if (anchorTime <= p.anchorTime) revert RotationNotForward(p.anchorTime, anchorTime);
+            // could be inserted behind an existing one and change history. An un-anchored
+            // predecessor has no time to be forward of.
+            if (anchored && p.anchored && anchorTime <= p.anchorTime) {
+                revert RotationNotForward(p.anchorTime, anchorTime);
+            }
         }
 
-        // v1 profile: the baseline governs from creation, because anchoring gives a binding a
-        // provable time rather than a birthday. Successors keep activatedAt = anchor, so a
-        // rotation still cannot claim retroactive coverage.
-        uint64 activatedAt = _chain.length == 0 ? 0 : anchorTime;
+        // ERC-8373: activation is inclusive and the interval is half-open, so a binding governs
+        // from its own anchor rather than from creation. An activation BEFORE that anchor would
+        // reopen the past, which anchoring exists to prevent, so it is recorded as malformed
+        // rather than clamped. Clamping would silently produce a plausible answer to a question
+        // the chain is not entitled to answer.
+        uint64 activatedAt = activationDeclared ? declaredActivation : anchorTime;
+        bool malformed = anchored && activationDeclared && declaredActivation < anchorTime;
 
         _chain.push(
             Binding({
                 contentAddress: contentAddress,
                 predecessor: predecessor,
+                anchored: anchored,
                 anchorTime: anchorTime,
                 activatedAt: activatedAt,
                 revokedAt: 0,
                 terminal: false,
+                malformed: malformed,
                 pqPubkey: pqPubkey
             })
         );
         _indexPlusOne[contentAddress] = _chain.length;
+        chainLoaded = true;
+    }
+
+    /// @notice Record that the chain was fetched and this identity has no bindings.
+    /// @dev    Distinct from never having loaded one. `bindings: []` is a determinate answer and
+    ///         refuses; an unloaded chain establishes nothing and is unverifiable.
+    function declareChainEmpty() external {
+        chainLoaded = true;
     }
 
     /// @notice Record an anchored revocation.
@@ -148,14 +211,51 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
     ///      Authority never reverts to a predecessor. That would resurrect something the owner
     ///      retired.
     function inForceBindingAt(uint64 anchorTime) public view override returns (bytes32) {
-        uint256 n = _chain.length;
-        for (uint256 i = n; i > 0; i--) {
-            Binding storage b = _chain[i - 1];
-            if (b.activatedAt > anchorTime) continue;
-            if (b.revokedAt != 0 && b.revokedAt <= anchorTime) return bytes32(0);
-            return b.contentAddress;
+        (bytes32 binding,) = _resolve(anchorTime);
+        return binding;
+    }
+
+    /// @notice Resolve the chain at an instant, returning both the binding and why.
+    /// @dev    The reason is not decoration. ERC-8373 forbids collapsing `pre_baseline` and ended
+    ///         authority into one answer, and they differ in outcome, not only in wording: the
+    ///         first admits the back catalogue and the second refuses it even before the cutoff.
+    ///         Returning bytes32(0) for both, which this contract used to do, is exactly that
+    ///         collapse.
+    function _resolve(uint64 anchorTime) internal view returns (bytes32 binding, PQReason reason) {
+        if (!chainLoaded) return (bytes32(0), PQReason.ChainUnavailable);
+        if (_chain.length == 0) return (bytes32(0), PQReason.NoBindingsInChain);
+
+        uint256 anchoredCount;
+        uint64 earliestActivation = type(uint64).max;
+
+        for (uint256 i = 0; i < _chain.length; i++) {
+            Binding storage b = _chain[i];
+            if (b.malformed) return (bytes32(0), PQReason.ChainMalformed);
+            // An un-anchored binding has no provable time, so it cannot govern anything. It is
+            // skipped rather than treated as absent, because whether ANY anchored binding remains
+            // is what separates "unreadable anchor" from "no bindings at all".
+            if (!b.anchored) continue;
+            anchoredCount++;
+            if (b.activatedAt < earliestActivation) earliestActivation = b.activatedAt;
         }
-        return bytes32(0);
+
+        if (anchoredCount == 0) return (bytes32(0), PQReason.BindingAnchorUnavailable);
+        if (anchorTime < earliestActivation) return (bytes32(0), PQReason.PreBaseline);
+
+        // Latest binding active at or before the instant, walking back so a rotation wins over the
+        // binding it replaces. Authority never reverts to a predecessor.
+        for (uint256 i = _chain.length; i > 0; i--) {
+            Binding storage b = _chain[i - 1];
+            if (!b.anchored) continue;
+            if (b.activatedAt > anchorTime) continue;
+            // Revocation is inclusive on the revoked side: at t == R authority has already ended.
+            if (b.revokedAt != 0 && b.revokedAt <= anchorTime) {
+                return (bytes32(0), PQReason.NoInForceBinding);
+            }
+            return (b.contentAddress, PQReason.ResolvedAtAnchorTime);
+        }
+
+        return (bytes32(0), PQReason.NoInForceBinding);
     }
 
     function pqPubkeyOf(bytes32 contentAddress) public view returns (bytes memory) {
@@ -175,45 +275,65 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
         public
         view
         override
-        returns (PQDecision, PQEvidence)
+        returns (PQDecision, PQEvidence, PQReason)
     {
         uint64 anchorTime = anchorRegistry.anchorTimeOf(artifactContentAddress);
 
         // An artifact whose anchor cannot be read is refused, but the evidence says we could not
         // tell rather than that it was bad. Merging those would let an indexing gap read as a
         // policy decision.
-        if (anchorTime == 0) return (PQDecision.Refuse, PQEvidence.Unverifiable);
+        if (anchorTime == 0) {
+            return (PQDecision.Refuse, PQEvidence.Unverifiable, PQReason.ChainUnavailable);
+        }
 
         // Resolution runs BEFORE the cutoff. A revocation ends authority at its anchor time and
         // that signal outranks the consumer's cutoff, so a post-revocation artifact is refused
         // even when it falls on the classical-only side.
-        bytes32 binding = inForceBindingAt(anchorTime);
-        if (binding == bytes32(0)) return (PQDecision.Refuse, PQEvidence.Refuted);
+        (bytes32 binding, PQReason reason) = _resolve(anchorTime);
+
+        if (binding == bytes32(0)) {
+            // Three of these refuse with evidence that nothing could be established, and two
+            // refuse with a determinate finding. Only the back catalogue is admitted, and only
+            // when it falls before the cutoff.
+            if (reason == PQReason.PreBaseline) {
+                return anchorTime < cutoff
+                    ? (PQDecision.Admit, PQEvidence.Verified, reason)
+                    : (PQDecision.Refuse, PQEvidence.Refuted, reason);
+            }
+            if (reason == PQReason.NoInForceBinding || reason == PQReason.NoBindingsInChain) {
+                return (PQDecision.Refuse, PQEvidence.Refuted, reason);
+            }
+            return (PQDecision.Refuse, PQEvidence.Unverifiable, reason);
+        }
 
         // "proven anchored before the consumer's cutoff". Strictly before.
-        if (anchorTime < cutoff) return (PQDecision.Admit, PQEvidence.Verified);
+        if (anchorTime < cutoff) return (PQDecision.Admit, PQEvidence.Verified, reason);
 
-        if (companion.length == 0) return (PQDecision.Refuse, PQEvidence.Refuted);
+        if (companion.length == 0) return (PQDecision.Refuse, PQEvidence.Refuted, reason);
 
         bytes memory pqPubkey = _chain[_indexPlusOne[binding] - 1].pqPubkey;
 
         // A verifier that cannot answer leaves the artifact unchecked. The gate still closes, but
         // the evidence records that nothing was refuted, only that nothing was established.
         try companionVerifier.verifyCompanion(artifactContentAddress, pqPubkey, companion) returns (bool ok) {
-            return ok ? (PQDecision.Admit, PQEvidence.Verified) : (PQDecision.Refuse, PQEvidence.Refuted);
+            return ok
+                ? (PQDecision.Admit, PQEvidence.Verified, reason)
+                : (PQDecision.Refuse, PQEvidence.Refuted, reason);
         } catch {
-            return (PQDecision.Refuse, PQEvidence.Unverifiable);
+            return (PQDecision.Refuse, PQEvidence.Unverifiable, reason);
         }
     }
 
     /// @notice Verify and emit, so a refusal leaves a trace rather than vanishing.
     function settleArtifact(bytes32 artifactContentAddress, bytes calldata companion)
         external
-        returns (PQDecision decision, PQEvidence evidence)
+        returns (PQDecision decision, PQEvidence evidence, PQReason reason)
     {
-        (decision, evidence) = verifyArtifact(artifactContentAddress, companion);
+        (decision, evidence, reason) = verifyArtifact(artifactContentAddress, companion);
         uint64 anchorTime = anchorRegistry.anchorTimeOf(artifactContentAddress);
-        emit ArtifactSettled(artifactContentAddress, inForceBindingAt(anchorTime), decision, evidence, anchorTime);
+        emit ArtifactSettled(
+            artifactContentAddress, inForceBindingAt(anchorTime), decision, evidence, reason, anchorTime
+        );
     }
 
     // ── ERC-165 ──────────────────────────────────────────────────────────────
