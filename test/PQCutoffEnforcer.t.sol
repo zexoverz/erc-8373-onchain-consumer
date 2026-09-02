@@ -182,6 +182,7 @@ contract PQCutoffEnforcerTest is Test {
     /// cases 21, 22 and 25 are unreachable under the old behaviour, which is how the gap was found.
     function test_unanchored_binding_is_admitted_but_never_governs() public {
         bytes32 ghost = keccak256("ghost");
+        vm.prank(CLASSICAL);
         enf.registerBinding(ghost, GENESIS, PK2);
 
         assertEq(enf.inForceBindingAt(CUTOFF - 1), GENESIS, "the anchored binding still governs");
@@ -192,6 +193,7 @@ contract PQCutoffEnforcerTest is Test {
     function test_only_unanchored_bindings_reports_binding_anchor_unavailable() public {
         MockAnchorRegistry sub = new MockAnchorRegistry();
         PQCutoffEnforcer bare = new PQCutoffEnforcer(CUTOFF, sub, ver, CLASSICAL);
+        vm.prank(CLASSICAL);
         bare.registerBinding(keccak256("ghost"), bytes32(0), PK2);
 
         bytes32 art = keccak256("artifact");
@@ -201,6 +203,56 @@ contract PQCutoffEnforcerTest is Test {
         assertEq(uint256(d), uint256(PQDecision.Refuse));
         assertEq(uint256(e), uint256(PQEvidence.Unverifiable), "an unreadable anchor is not a refutation");
         assertEq(uint256(r), uint256(PQReason.BindingAnchorUnavailable));
+    }
+
+    // ── Chain state is the identity's to change ──────────────────────────────
+
+    /// Un-anchored registration has no substrate fact behind it, so the caller has to be the
+    /// identity. Left open, `AlreadyRegistered` keys on the content-address alone, so a squatter
+    /// could register an un-anchored binding first and permanently block the real one from ever
+    /// entering the chain. Content-addresses here are deterministic and visible before the
+    /// anchoring transaction lands, so this was reachable.
+    function test_stranger_cannot_squat_an_unanchored_binding() public {
+        bytes32 ghost = keccak256("squat");
+        vm.prank(address(0xBAD));
+        vm.expectRevert(
+            abi.encodeWithSelector(PQCutoffEnforcer.NotClassicalAddress.selector, CLASSICAL, address(0xBAD))
+        );
+        enf.registerBinding(ghost, GENESIS, PK2);
+
+        // and the owner can still register it afterwards
+        vm.prank(CLASSICAL);
+        enf.registerBinding(ghost, GENESIS, PK2);
+    }
+
+    /// Terminality closes the chain to further rotation. A stranger who could set it would strand
+    /// the identity on a key it can no longer rotate away from, which is the situation this
+    /// contract exists to let it escape.
+    function test_stranger_cannot_close_the_chain() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(
+            abi.encodeWithSelector(PQCutoffEnforcer.NotClassicalAddress.selector, CLASSICAL, address(0xBAD))
+        );
+        enf.markTerminal(GENESIS);
+    }
+
+    /// It cannot force an admission, but it can flip an identity's evidence from Unverifiable to
+    /// Refuted before the owner has loaded anything, and that distinction is the point.
+    function test_stranger_cannot_declare_the_chain_empty() public {
+        MockAnchorRegistry sub = new MockAnchorRegistry();
+        PQCutoffEnforcer bare = new PQCutoffEnforcer(CUTOFF, sub, ver, CLASSICAL);
+
+        vm.prank(address(0xBAD));
+        vm.expectRevert(
+            abi.encodeWithSelector(PQCutoffEnforcer.NotClassicalAddress.selector, CLASSICAL, address(0xBAD))
+        );
+        bare.declareChainEmpty();
+
+        bytes32 art = keccak256("artifact");
+        sub.anchor(art, CUTOFF - 1, CLASSICAL);
+        (, PQEvidence e, PQReason r,) = bare.verifyArtifact(art, "");
+        assertEq(uint256(e), uint256(PQEvidence.Unverifiable), "still nothing established");
+        assertEq(uint256(r), uint256(PQReason.ChainUnavailable));
     }
 
     /// A chain nobody loaded is not a chain that resolves to nothing.
@@ -215,6 +267,7 @@ contract PQCutoffEnforcerTest is Test {
         assertEq(uint256(e), uint256(PQEvidence.Unverifiable), "nothing was established");
         assertEq(uint256(r), uint256(PQReason.ChainUnavailable));
 
+        vm.prank(CLASSICAL);
         bare.declareChainEmpty();
         (, PQEvidence e2, PQReason r2,) = bare.verifyArtifact(art, "");
         assertEq(uint256(e2), uint256(PQEvidence.Refuted), "an empty chain is a determinate answer");

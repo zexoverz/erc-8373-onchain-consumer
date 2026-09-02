@@ -96,22 +96,29 @@ contract CutoffVectorsTest is Test {
         ver = new VectorCompanionVerifier();
         enf = new PQCutoffEnforcer(consumerCutoff, sub, ver, CLASSICAL);
 
+        // Chain state mutators are owner-only, so build every case as the identity itself.
+        vm.startPrank(CLASSICAL);
+        _buildChain(enf, sub, i);
+        vm.stopPrank();
+    }
+
+    function _buildChain(PQCutoffEnforcer enf, VectorAnchorSubstrate sub, uint256 i) internal {
         ChainShape shape = VectorChain.shapeOf(json, i);
 
         // `bindings: null`. Load nothing at all, which is now a state the enforcer can hold.
-        if (shape == ChainShape.Unavailable) return (enf, ver);
+        if (shape == ChainShape.Unavailable) return;
 
         // `bindings: []`. Fetched, and this identity has none. A different fact from the above.
         if (shape == ChainShape.Empty) {
             enf.declareChainEmpty();
-            return (enf, ver);
+            return;
         }
 
         if (shape == ChainShape.Default) {
             bytes32 ca = keccak256(bytes(vm.parseJsonString(json, ".bindings[0].name")));
             sub.anchor(ca, uint64(vm.parseJsonUint(json, ".bindings[0].binding_anchor_time")), CLASSICAL);
             enf.registerBinding(ca, bytes32(0), bytes(vm.parseJsonString(json, ".bindings[0].pq_pubkey")));
-            return (enf, ver);
+            return;
         }
 
         uint256 n = VectorChain.countOf(json, i);

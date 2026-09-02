@@ -55,6 +55,8 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
     error PredecessorNotInChain(bytes32 predecessor);
     error ChainIsTerminal();
     error RotationNotForward(uint64 predecessorAnchor, uint64 anchorTime);
+    error NotClassicalAddress(address expected, address actual);
+    error UnhandledReason(PQReason reason);
 
     constructor(
         uint64 cutoff_,
@@ -122,6 +124,14 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
         if (anchored) {
             address anchorer = anchorRegistry.anchoredBy(contentAddress);
             if (anchorer != classicalAddress) revert WrongAnchorer(classicalAddress, anchorer);
+        } else if (msg.sender != classicalAddress) {
+            // With no anchor there is no substrate fact to check, so the caller has to be the
+            // identity itself. Leaving this open let anyone register an un-anchored binding for an
+            // arbitrary content-address, and since `AlreadyRegistered` keys on the content-address
+            // alone, a squatter could permanently block the real binding from ever entering the
+            // chain. Content-addresses here are deterministic and observable before the anchoring
+            // transaction lands, so that was reachable rather than theoretical.
+            revert NotClassicalAddress(classicalAddress, msg.sender);
         }
 
         if (_chain.length != 0) {
@@ -167,6 +177,10 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
     /// @dev    Distinct from never having loaded one. `bindings: []` is a determinate answer and
     ///         refuses; an unloaded chain establishes nothing and is unverifiable.
     function declareChainEmpty() external {
+        // Owner-only. It cannot force an admission, but left open it let an outsider flip an
+        // identity's evidence from Unverifiable to Refuted before the owner had loaded anything,
+        // which is precisely the distinction this contract exists to keep honest.
+        if (msg.sender != classicalAddress) revert NotClassicalAddress(classicalAddress, msg.sender);
         chainLoaded = true;
     }
 
@@ -187,7 +201,13 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
     }
 
     /// @notice Mark a binding terminal, closing the chain to further rotation.
+    /// @dev Owner-only. Terminality is a standing constraint on the future binding path, and
+    ///      `registerBindingWithActivation` refuses to rotate past a terminal predecessor. Left
+    ///      open, any address could close the chain permanently and strand the identity on a key
+    ///      it can no longer rotate away from, which is the exact situation this contract exists
+    ///      to let it escape.
     function markTerminal(bytes32 contentAddress) external {
+        if (msg.sender != classicalAddress) revert NotClassicalAddress(classicalAddress, msg.sender);
         uint256 i = _indexPlusOne[contentAddress];
         if (i == 0) revert UnknownBinding(contentAddress);
         _chain[i - 1].terminal = true;
@@ -317,10 +337,14 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
             if (reason == PQReason.ChainUnavailable) {
                 return (PQDecision.Refuse, PQEvidence.Unverifiable, reason, PQRule.ChainUnavailable);
             }
-            // Every reason that can reach here is named above. This last one is BindingAnchorUnavailable
-            // and is written out rather than left as a catch-all, because a fallthrough here silently
-            // relabels any reason added later. Case 12 was mislabelled exactly that way.
-            return (PQDecision.Refuse, PQEvidence.Unverifiable, reason, PQRule.BindingAnchorUnavailable);
+            if (reason == PQReason.BindingAnchorUnavailable) {
+                return (PQDecision.Refuse, PQEvidence.Unverifiable, reason, PQRule.BindingAnchorUnavailable);
+            }
+            // Every reason reachable here is named above, so this is unreachable today. It reverts
+            // rather than returning, because the previous version ended in an implicit else and
+            // chain_unavailable fell through it to be reported as binding_anchor_unavailable. A
+            // reason added later must break loudly instead of being relabelled.
+            revert UnhandledReason(reason);
         }
 
         // "proven anchored before the consumer's cutoff". Strictly before.
