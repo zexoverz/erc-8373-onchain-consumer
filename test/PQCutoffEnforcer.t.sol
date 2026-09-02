@@ -75,11 +75,11 @@ contract PQCutoffEnforcerTest is Test {
     }
 
     function _dec(bytes32 a, bytes memory c) internal view returns (PQDecision d) {
-        (d,,) = enf.verifyArtifact(a, c);
+        (d,,,) = enf.verifyArtifact(a, c);
     }
 
     function _ev(bytes32 a, bytes memory c) internal view returns (PQEvidence e) {
-        (, e,) = enf.verifyArtifact(a, c);
+        (, e,,) = enf.verifyArtifact(a, c);
     }
 
     function _artifact(bytes32 id, uint64 t) internal returns (bytes32) {
@@ -197,7 +197,7 @@ contract PQCutoffEnforcerTest is Test {
         bytes32 art = keccak256("artifact");
         sub.anchor(art, CUTOFF - 1, CLASSICAL);
 
-        (PQDecision d, PQEvidence e, PQReason r) = bare.verifyArtifact(art, "");
+        (PQDecision d, PQEvidence e, PQReason r,) = bare.verifyArtifact(art, "");
         assertEq(uint256(d), uint256(PQDecision.Refuse));
         assertEq(uint256(e), uint256(PQEvidence.Unverifiable), "an unreadable anchor is not a refutation");
         assertEq(uint256(r), uint256(PQReason.BindingAnchorUnavailable));
@@ -211,12 +211,12 @@ contract PQCutoffEnforcerTest is Test {
         bytes32 art = keccak256("artifact");
         sub.anchor(art, CUTOFF - 1, CLASSICAL);
 
-        (, PQEvidence e, PQReason r) = bare.verifyArtifact(art, "");
+        (, PQEvidence e, PQReason r,) = bare.verifyArtifact(art, "");
         assertEq(uint256(e), uint256(PQEvidence.Unverifiable), "nothing was established");
         assertEq(uint256(r), uint256(PQReason.ChainUnavailable));
 
         bare.declareChainEmpty();
-        (, PQEvidence e2, PQReason r2) = bare.verifyArtifact(art, "");
+        (, PQEvidence e2, PQReason r2,) = bare.verifyArtifact(art, "");
         assertEq(uint256(e2), uint256(PQEvidence.Refuted), "an empty chain is a determinate answer");
         assertEq(uint256(r2), uint256(PQReason.NoBindingsInChain));
     }

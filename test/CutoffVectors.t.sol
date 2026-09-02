@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
 import {PQCutoffEnforcer} from "../src/PQCutoffEnforcer.sol";
-import {IPQAnchorRegistry, IPQCompanionVerifier, PQDecision, PQEvidence, PQReason} from "../src/IPQKeyBindingConsumer.sol";
+import {IPQAnchorRegistry, IPQCompanionVerifier, PQDecision, PQEvidence, PQReason, PQRule} from "../src/IPQKeyBindingConsumer.sol";
 import {VectorChain, VectorBinding, ChainShape} from "./VectorChain.sol";
 
 /// @notice A substrate replaying the anchor times the vectors record, and nothing else.
@@ -136,7 +136,10 @@ contract CutoffVectorsTest is Test {
         }
     }
 
-    function _runCase(uint256 i) internal returns (PQDecision decision, PQEvidence evidence, PQReason reason) {
+    function _runCase(uint256 i)
+        internal
+        returns (PQDecision decision, PQEvidence evidence, PQReason reason, PQRule rule)
+    {
         (PQCutoffEnforcer enf, VectorCompanionVerifier ver) = _build(i);
 
         VectorAnchorSubstrate sub = VectorAnchorSubstrate(address(enf.anchorRegistry()));
@@ -145,7 +148,7 @@ contract CutoffVectorsTest is Test {
         sub.anchor(artifact, anchorTime, CLASSICAL);
 
         bytes memory companion = _configureCompanion(i, ver);
-        (decision, evidence, reason) = enf.verifyArtifact(artifact, companion);
+        (decision, evidence, reason, rule) = enf.verifyArtifact(artifact, companion);
     }
 
     /// Reads the companion block for a case and configures the verifier to match it.
@@ -192,6 +195,22 @@ contract CutoffVectorsTest is Test {
         return PQEvidence.Verified;
     }
 
+    function _asRule(string memory r) internal pure returns (PQRule) {
+        bytes32 h = keccak256(bytes(r));
+        if (h == keccak256("anchored_before_cutoff")) return PQRule.AnchoredBeforeCutoff;
+        if (h == keccak256("valid_pq_companion")) return PQRule.ValidPqCompanion;
+        if (h == keccak256("pre_baseline_legacy_admit")) return PQRule.PreBaselineLegacyAdmit;
+        if (h == keccak256("post_cutoff_no_valid_companion")) return PQRule.PostCutoffNoValidCompanion;
+        if (h == keccak256("post_cutoff_companion_unchecked")) return PQRule.PostCutoffCompanionUnchecked;
+        if (h == keccak256("post_cutoff_anchor_status_unknown")) return PQRule.PostCutoffAnchorStatusUnknown;
+        if (h == keccak256("no_in_force_binding")) return PQRule.NoInForceBinding;
+        if (h == keccak256("no_bindings_in_chain")) return PQRule.NoBindingsInChain;
+        if (h == keccak256("chain_unavailable")) return PQRule.ChainUnavailable;
+        if (h == keccak256("chain_malformed")) return PQRule.ChainMalformed;
+        if (h == keccak256("binding_anchor_unavailable")) return PQRule.BindingAnchorUnavailable;
+        revert(string.concat("vector declares a rule this enum has no value for: ", r));
+    }
+
     function _asReason(string memory r) internal pure returns (PQReason) {
         bytes32 h = keccak256(bytes(r));
         if (h == keccak256("resolved_at_anchor_time")) return PQReason.ResolvedAtAnchorTime;
@@ -229,11 +248,26 @@ contract CutoffVectorsTest is Test {
     /// reported as the same answer, which the ERC forbids by name.
     function test_enforcer_reproduces_every_v1_reason() public {
         for (uint256 i = 0; i < caseCount; i++) {
-            (,, PQReason got) = _runCase(i);
+            (,, PQReason got,) = _runCase(i);
             assertEq(
                 uint256(got),
                 uint256(_asReason(_expected(i, "resolution_reason"))),
                 string.concat("case ", vm.toString(i), " reason")
+            );
+        }
+    }
+
+    /// The rule is the profile's own closed set, eleven values, and it is not a rename of the
+    /// reason. A `resolved_at_anchor_time` resolution still admits under `anchored_before_cutoff`
+    /// or `valid_pq_companion` and refuses under `post_cutoff_no_valid_companion`, so surfacing
+    /// only the reason loses which limb of the cutoff rule actually fired.
+    function test_enforcer_reproduces_every_v1_rule() public {
+        for (uint256 i = 0; i < caseCount; i++) {
+            (,,, PQRule got) = _runCase(i);
+            assertEq(
+                uint256(got),
+                uint256(_asRule(_expected(i, "rule"))),
+                string.concat("case ", vm.toString(i), " rule")
             );
         }
     }
@@ -245,8 +279,8 @@ contract CutoffVectorsTest is Test {
         (uint256 ended, bool foundEnded) = _firstCaseWithReason("no_in_force_binding");
         assertTrue(foundPre && foundEnded, "the file must declare both");
 
-        (PQDecision dPre,, PQReason rPre) = _runCase(pre);
-        (PQDecision dEnd,, PQReason rEnd) = _runCase(ended);
+        (PQDecision dPre,, PQReason rPre,) = _runCase(pre);
+        (PQDecision dEnd,, PQReason rEnd,) = _runCase(ended);
 
         assertTrue(rPre != rEnd, "one reason for both would be the collapse the ERC forbids");
         assertEq(uint256(dPre), uint256(PQDecision.Admit), "the back catalogue is admitted");
@@ -256,7 +290,7 @@ contract CutoffVectorsTest is Test {
     /// Every published case reproduces on the admission decision.
     function test_enforcer_reproduces_every_v1_decision() public {
         for (uint256 i = 0; i < caseCount; i++) {
-            (PQDecision got,,) = _runCase(i);
+            (PQDecision got,,,) = _runCase(i);
             assertEq(
                 uint256(got),
                 uint256(_asDecision(_expected(i, "decision"))),
@@ -269,7 +303,7 @@ contract CutoffVectorsTest is Test {
     function test_enforcer_reproduces_every_v1_evidence() public {
         uint256 checked;
         for (uint256 i = 0; i < caseCount; i++) {
-            (, PQEvidence got,) = _runCase(i);
+            (, PQEvidence got,,) = _runCase(i);
             assertEq(
                 uint256(got),
                 uint256(_asEvidence(_expected(i, "evidence"))),
@@ -288,8 +322,8 @@ contract CutoffVectorsTest is Test {
         (uint256 unvCase, bool foundU) = _firstCaseWithEvidence("unverifiable");
         assertTrue(foundR && foundU, "the file must declare both evidence states");
 
-        (PQDecision dRef, PQEvidence eRef,) = _runCase(refutedCase);
-        (PQDecision dUnc, PQEvidence eUnc,) = _runCase(unvCase);
+        (PQDecision dRef, PQEvidence eRef,,) = _runCase(refutedCase);
+        (PQDecision dUnc, PQEvidence eUnc,,) = _runCase(unvCase);
 
         assertEq(uint256(dRef), uint256(PQDecision.Refuse));
         assertEq(uint256(dUnc), uint256(PQDecision.Refuse));

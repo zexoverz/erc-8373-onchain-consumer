@@ -7,7 +7,8 @@ import {
     IPQCompanionVerifier,
     PQDecision,
     PQEvidence,
-    PQReason
+    PQReason,
+    PQRule
 } from "./IPQKeyBindingConsumer.sol";
 
 /// @title A reference ERC-8373 cutoff enforcer
@@ -275,7 +276,7 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
         public
         view
         override
-        returns (PQDecision, PQEvidence, PQReason)
+        returns (PQDecision, PQEvidence, PQReason, PQRule)
     {
         uint64 anchorTime = anchorRegistry.anchorTimeOf(artifactContentAddress);
 
@@ -283,7 +284,12 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
         // tell rather than that it was bad. Merging those would let an indexing gap read as a
         // policy decision.
         if (anchorTime == 0) {
-            return (PQDecision.Refuse, PQEvidence.Unverifiable, PQReason.ChainUnavailable);
+            return (
+                PQDecision.Refuse,
+                PQEvidence.Unverifiable,
+                PQReason.ChainUnavailable,
+                PQRule.PostCutoffAnchorStatusUnknown
+            );
         }
 
         // Resolution runs BEFORE the cutoff. A revocation ends authority at its anchor time and
@@ -292,24 +298,39 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
         (bytes32 binding, PQReason reason) = _resolve(anchorTime);
 
         if (binding == bytes32(0)) {
-            // Three of these refuse with evidence that nothing could be established, and two
-            // refuse with a determinate finding. Only the back catalogue is admitted, and only
-            // when it falls before the cutoff.
+            // Only the back catalogue is admitted, and only before the cutoff. The other four
+            // refuse, two of them determinately and two because nothing could be established.
             if (reason == PQReason.PreBaseline) {
                 return anchorTime < cutoff
-                    ? (PQDecision.Admit, PQEvidence.Verified, reason)
-                    : (PQDecision.Refuse, PQEvidence.Refuted, reason);
+                    ? (PQDecision.Admit, PQEvidence.Verified, reason, PQRule.PreBaselineLegacyAdmit)
+                    : (PQDecision.Refuse, PQEvidence.Refuted, reason, PQRule.PostCutoffNoValidCompanion);
             }
-            if (reason == PQReason.NoInForceBinding || reason == PQReason.NoBindingsInChain) {
-                return (PQDecision.Refuse, PQEvidence.Refuted, reason);
+            if (reason == PQReason.NoInForceBinding) {
+                return (PQDecision.Refuse, PQEvidence.Refuted, reason, PQRule.NoInForceBinding);
             }
-            return (PQDecision.Refuse, PQEvidence.Unverifiable, reason);
+            if (reason == PQReason.NoBindingsInChain) {
+                return (PQDecision.Refuse, PQEvidence.Refuted, reason, PQRule.NoBindingsInChain);
+            }
+            if (reason == PQReason.ChainMalformed) {
+                return (PQDecision.Refuse, PQEvidence.Unverifiable, reason, PQRule.ChainMalformed);
+            }
+            if (reason == PQReason.ChainUnavailable) {
+                return (PQDecision.Refuse, PQEvidence.Unverifiable, reason, PQRule.ChainUnavailable);
+            }
+            // Every reason that can reach here is named above. This last one is BindingAnchorUnavailable
+            // and is written out rather than left as a catch-all, because a fallthrough here silently
+            // relabels any reason added later. Case 12 was mislabelled exactly that way.
+            return (PQDecision.Refuse, PQEvidence.Unverifiable, reason, PQRule.BindingAnchorUnavailable);
         }
 
         // "proven anchored before the consumer's cutoff". Strictly before.
-        if (anchorTime < cutoff) return (PQDecision.Admit, PQEvidence.Verified, reason);
+        if (anchorTime < cutoff) {
+            return (PQDecision.Admit, PQEvidence.Verified, reason, PQRule.AnchoredBeforeCutoff);
+        }
 
-        if (companion.length == 0) return (PQDecision.Refuse, PQEvidence.Refuted, reason);
+        if (companion.length == 0) {
+            return (PQDecision.Refuse, PQEvidence.Refuted, reason, PQRule.PostCutoffNoValidCompanion);
+        }
 
         bytes memory pqPubkey = _chain[_indexPlusOne[binding] - 1].pqPubkey;
 
@@ -317,22 +338,24 @@ contract PQCutoffEnforcer is IPQKeyBindingConsumer {
         // the evidence records that nothing was refuted, only that nothing was established.
         try companionVerifier.verifyCompanion(artifactContentAddress, pqPubkey, companion) returns (bool ok) {
             return ok
-                ? (PQDecision.Admit, PQEvidence.Verified, reason)
-                : (PQDecision.Refuse, PQEvidence.Refuted, reason);
+                ? (PQDecision.Admit, PQEvidence.Verified, reason, PQRule.ValidPqCompanion)
+                : (PQDecision.Refuse, PQEvidence.Refuted, reason, PQRule.PostCutoffNoValidCompanion);
         } catch {
-            return (PQDecision.Refuse, PQEvidence.Unverifiable, reason);
+            return (
+                PQDecision.Refuse, PQEvidence.Unverifiable, reason, PQRule.PostCutoffCompanionUnchecked
+            );
         }
     }
 
     /// @notice Verify and emit, so a refusal leaves a trace rather than vanishing.
     function settleArtifact(bytes32 artifactContentAddress, bytes calldata companion)
         external
-        returns (PQDecision decision, PQEvidence evidence, PQReason reason)
+        returns (PQDecision decision, PQEvidence evidence, PQReason reason, PQRule rule)
     {
-        (decision, evidence, reason) = verifyArtifact(artifactContentAddress, companion);
+        (decision, evidence, reason, rule) = verifyArtifact(artifactContentAddress, companion);
         uint64 anchorTime = anchorRegistry.anchorTimeOf(artifactContentAddress);
         emit ArtifactSettled(
-            artifactContentAddress, inForceBindingAt(anchorTime), decision, evidence, reason, anchorTime
+            artifactContentAddress, inForceBindingAt(anchorTime), decision, evidence, reason, rule, anchorTime
         );
     }
 

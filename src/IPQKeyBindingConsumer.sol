@@ -57,6 +57,32 @@ enum PQReason {
     BindingAnchorUnavailable // 6 — every declared binding lacks a readable anchor.
 }
 
+/// @notice Which admission rule actually decided the verdict.
+///
+/// @dev Distinct from `PQReason`, and both are needed. `PQReason` says how the chain resolved;
+///      `PQRule` says which clause of the cutoff rule then fired. They coincide on the failure
+///      paths and diverge on the successful ones: a `ResolvedAtAnchorTime` resolution still admits
+///      via `AnchoredBeforeCutoff` or `ValidPqCompanion`, and refuses via
+///      `PostCutoffNoValidCompanion` or `PostCutoffCompanionUnchecked`. Collapsing them would lose
+///      the difference between "admitted because it predates the cutoff" and "admitted because the
+///      companion verified", which is the whole point of the cutoff rule having two limbs.
+///
+///      `Unset` holds the zero slot so an unread or uninitialised value cannot read as an admission.
+enum PQRule {
+    Unset, // 0 — nothing decided. Never a valid published verdict.
+    AnchoredBeforeCutoff, // 1
+    ValidPqCompanion, // 2
+    PreBaselineLegacyAdmit, // 3
+    PostCutoffNoValidCompanion, // 4
+    PostCutoffCompanionUnchecked, // 5
+    PostCutoffAnchorStatusUnknown, // 6
+    NoInForceBinding, // 7
+    NoBindingsInChain, // 8
+    ChainUnavailable, // 9
+    ChainMalformed, // 10
+    BindingAnchorUnavailable // 11
+}
+
 // ── Anchor substrate ─────────────────────────────────────────────────────────
 
 /// @notice The anchor substrate, read-side.
@@ -132,10 +158,11 @@ interface IPQKeyBindingConsumer {
     /// @return decision whether to admit; `Refuse` is the zero value so anything undecided fails closed
     /// @return evidence what could actually be established, which `decision` alone cannot carry
     /// @return reason the closed-enumeration cause ERC-8373 requires an unverifiable to carry
+    /// @return rule which limb of the cutoff rule decided it, from the profile's closed rule set
     function verifyArtifact(bytes32 artifactContentAddress, bytes calldata companion)
         external
         view
-        returns (PQDecision decision, PQEvidence evidence, PQReason reason);
+        returns (PQDecision decision, PQEvidence evidence, PQReason reason, PQRule rule);
 
     /// @notice The binding governing artifacts anchored at `anchorTime`, resolved from the chain.
     /// @dev    ERC-8373: "Resolution MUST run from the chain even at length one." Rotations are
@@ -155,6 +182,7 @@ interface IPQKeyBindingConsumer {
         PQDecision decision,
         PQEvidence evidence,
         PQReason reason,
+        PQRule rule,
         uint64 anchorTime
     );
 }
